@@ -1,5 +1,5 @@
 // ============================================================
-// VeloCoach AI — Backend Server
+// VeloCoach AI â Backend Server
 // Handles Strava OAuth and proxies activity data to the frontend
 // ============================================================
 
@@ -29,7 +29,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'VeloCoach Backend',
-    endpoints: ['/strava/auth', '/strava/callback', '/strava/activities']
+    endpoints: ['/strava/auth', '/strava/callback', '/strava/activities', '/tp/connect', '/tp/workouts', '/tp/athlete']
   });
 });
 
@@ -116,7 +116,7 @@ async function refreshStravaToken(athleteId) {
     return stored.access_token; // Still valid
   }
 
-  // Token expired — refresh it
+  // Token expired â refresh it
   console.log(`Refreshing Strava token for athlete ${athleteId}...`);
   const response = await fetch('https://www.strava.com/oauth/token', {
     method: 'POST',
@@ -197,9 +197,211 @@ app.get('/strava/status', (req, res) => {
   res.json({ connected, athlete_id: connected ? athlete_id : null });
 });
 
+// ==========================================================
+//  TRAININGPEAKS API PROXY
+//  The frontend stores the user's TP bearer token (from their
+//  logged-in session) and athlete ID. We proxy all TP API calls
+//  through here to avoid CORS blocks.
+// ==========================================================
+
+// In-memory TP token store (keyed by athlete ID)
+const tpTokenStore = {};
+
+// Save TP credentials (called from frontend after user provides token)
+app.post('/tp/connect', (req, res) => {
+  const { athlete_id, token } = req.body;
+  if (!athlete_id || !token) {
+    return res.status(400).json({ error: 'athlete_id and token are required' });
+  }
+  tpTokenStore[athlete_id] = { token, connected_at: Date.now() };
+  console.log(`TrainingPeaks connected for athlete ${athlete_id}`);
+  res.json({ connected: true, athlete_id });
+});
+
+// Check TP connection status
+app.get('/tp/status', (req, res) => {
+  const { athlete_id } = req.query;
+  const connected = !!(athlete_id && tpTokenStore[athlete_id]);
+  res.json({ connected, athlete_id: connected ? athlete_id : null });
+});
+
+// Disconnect TP
+app.post('/tp/disconnect', (req, res) => {
+  const { athlete_id } = req.body;
+  if (athlete_id && tpTokenStore[athlete_id]) {
+    delete tpTokenStore[athlete_id];
+  }
+  res.json({ connected: false });
+});
+
+// Helper: get TP token or return 401
+function getTPToken(athlete_id, res) {
+  if (!athlete_id || !tpTokenStore[athlete_id]) {
+    res.status(401).json({
+      error: 'Not connected',
+      message: 'TrainingPeaks is not connected. Please connect first.'
+    });
+    return null;
+  }
+  return tpTokenStore[athlete_id].token;
+}
+
+// GET workouts for a date range
+app.get('/tp/workouts', async (req, res) => {
+  const { athlete_id, start_date, end_date } = req.query;
+  const token = getTPToken(athlete_id, res);
+  if (!token) return;
+
+  try {
+    const url = `https://tpapi.trainingpeaks.com/fitness/v6/athletes/${athlete_id}/workouts/${start_date}/${end_date}`;
+    const response = await fetch(url, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      console.error(`TP workouts fetch failed (${response.status}):`, text);
+      return res.status(response.status).json({ error: 'Failed to fetch workouts', detail: text });
+    }
+
+    const workouts = await response.json();
+    res.json(workouts);
+  } catch (error) {
+    console.error('TP workouts error:', error);
+    res.status(500).json({ error: 'Failed to fetch workouts from TrainingPeaks' });
+  }
+});
+
+// POST create a new workout
+app.post('/tp/workouts', async (req, res) => {
+  const { athlete_id } = req.query;
+  const token = getTPToken(athlete_id, res);
+  if (!token) return;
+
+  try {
+    const url = `https://tpapi.trainingpeaks.com/fitness/v1/athletes/${athlete_id}/workouts`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify(req.body)
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      console.error(`TP create workout failed (${response.status}):`, text);
+      return res.status(response.status).json({ error: 'Failed to create workout', detail: text });
+    }
+
+    const workout = await response.json();
+    console.log(`TP workout created for athlete ${athlete_id}: ${workout.workoutId || workout.id || 'ok'}`);
+    res.json(workout);
+  } catch (error) {
+    console.error('TP create workout error:', error);
+    res.status(500).json({ error: 'Failed to create workout on TrainingPeaks' });
+  }
+});
+
+// PUT update an existing workout
+app.put('/tp/workouts/:workoutId', async (req, res) => {
+  const { athlete_id } = req.query;
+  const { workoutId } = req.params;
+  const token = getTPToken(athlete_id, res);
+  if (!token) return;
+
+  try {
+    const url = `https://tpapi.trainingpeaks.com/fitness/v3/athletes/${athlete_id}/workouts/${workoutId}`;
+    const response = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify(req.body)
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      console.error(`TP update workout failed (${response.status}):`, text);
+      return res.status(response.status).json({ error: 'Failed to update workout', detail: text });
+    }
+
+    const workout = await response.json();
+    res.json(workout);
+  } catch (error) {
+    console.error('TP update workout error:', error);
+    res.status(500).json({ error: 'Failed to update workout on TrainingPeaks' });
+  }
+});
+
+// DELETE a workout
+app.delete('/tp/workouts/:workoutId', async (req, res) => {
+  const { athlete_id } = req.query;
+  const { workoutId } = req.params;
+  const token = getTPToken(athlete_id, res);
+  if (!token) return;
+
+  try {
+    const url = `https://tpapi.trainingpeaks.com/fitness/v3/athletes/${athlete_id}/workouts/${workoutId}`;
+    const response = await fetch(url, {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      console.error(`TP delete workout failed (${response.status}):`, text);
+      return res.status(response.status).json({ error: 'Failed to delete workout', detail: text });
+    }
+
+    res.json({ deleted: true, workoutId });
+  } catch (error) {
+    console.error('TP delete workout error:', error);
+    res.status(500).json({ error: 'Failed to delete workout on TrainingPeaks' });
+  }
+});
+
+// GET athlete profile/info from TP
+app.get('/tp/athlete', async (req, res) => {
+  const { athlete_id } = req.query;
+  const token = getTPToken(athlete_id, res);
+  if (!token) return;
+
+  try {
+    const response = await fetch(`https://tpapi.trainingpeaks.com/users/v3/user`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      return res.status(response.status).json({ error: 'Failed to fetch TP profile', detail: text });
+    }
+
+    const profile = await response.json();
+    res.json(profile);
+  } catch (error) {
+    console.error('TP athlete error:', error);
+    res.status(500).json({ error: 'Failed to fetch TrainingPeaks profile' });
+  }
+});
+
 // ---------- Start the server ----------
 app.listen(PORT, () => {
   console.log(`VeloCoach Backend running on port ${PORT}`);
   console.log(`Frontend URL: ${process.env.FRONTEND_URL}`);
   console.log(`Strava auth: ${process.env.BACKEND_URL}/strava/auth`);
+  console.log(`TrainingPeaks proxy: enabled`);
 });
