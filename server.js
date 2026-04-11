@@ -11,9 +11,21 @@ const app     = express();
 const PORT    = process.env.PORT || 3000;
 
 // ---------- CORS ----------
+const ALLOWED_ORIGINS = [
+    'https://velocoach-ai.netlify.app',
+    'https://app.velocoach-ai.com'
+  ];
+if (process.env.FRONTEND_URL) ALLOWED_ORIGINS.push(process.env.FRONTEND_URL);
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'https://velocoach-ai.netlify.app',
-  credentials: true
+    origin: function(origin, callback) {
+          if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+                  callback(null, true);
+          } else {
+                  callback(new Error('Not allowed by CORS'));
+          }
+    },
+    credentials: true
 }));
 app.use(express.json());
 
