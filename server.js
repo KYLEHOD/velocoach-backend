@@ -383,7 +383,7 @@ app.get('/strava/callback', async (req, res) => {
     );
     tokenStore[athleteId] = { access_token: data.access_token, refresh_token: data.refresh_token, expires_at: data.expires_at, athlete: data.athlete };
     console.log(`Strava connected for ${data.athlete.firstname} ${data.athlete.lastname} (${athleteId}), user ${userId}`);
-    const frontendUrl = process.env.FRONTEND_URL || 'https://velocoach-ai.netlify.app';
+    const frontendUrl = process.env.FRONTEND_URL || 'https://app.velocoach-ai.com';
     res.redirect(`${frontendUrl}?strava_connected=true`);
   } catch (error) {
     console.error('OAuth callback error:', error);
