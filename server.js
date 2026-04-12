@@ -45,6 +45,7 @@ async function initSchema() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_access_token  TEXT`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_refresh_token TEXT`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_expires_at    INTEGER`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS settings             JSONB DEFAULT '{}'`);
 
   // Coaching queries log — rate limiting + analytics
   await pool.query(`
@@ -159,7 +160,7 @@ app.post('/auth/login', async (req, res) => {
   const normalizedEmail = email.toLowerCase().trim();
   try {
     const { rows } = await pool.query(
-      `SELECT id, email, name, password_hash, ftp, weight FROM users WHERE email = $1`,
+      `SELECT id, email, name, password_hash, ftp, weight, settings, strava_athlete_id FROM users WHERE email = $1`,
       [normalizedEmail]
     );
     const user = rows[0];
@@ -170,7 +171,12 @@ app.post('/auth/login', async (req, res) => {
 
     const token = signToken(user.id, user.email);
     console.log(`User logged in: ${user.email}`);
-    res.json({ token, userId: user.id, email: user.email, name: user.name, profile: { ftp: user.ftp, weight: user.weight } });
+    res.json({
+      token, userId: user.id, email: user.email, name: user.name,
+      profile: { ftp: user.ftp, weight: user.weight },
+      settings: user.settings || {},
+      strava_athlete_id: user.strava_athlete_id || null
+    });
   } catch (e) {
     console.error('Login error:', e);
     res.status(500).json({ error: 'Login failed' });
@@ -210,6 +216,40 @@ app.put('/auth/profile', requireAuth, async (req, res) => {
     res.json({ userId: u.id, email: u.email, name: u.name, profile: { ftp: u.ftp, weight: u.weight } });
   } catch (e) {
     res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+// Get user settings (for cross-device sync)
+app.get('/auth/settings', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT settings, strava_athlete_id, name, ftp, weight FROM users WHERE id = $1`,
+      [req.user.userId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+    const u = rows[0];
+    res.json({
+      settings: u.settings || {},
+      strava_athlete_id: u.strava_athlete_id || null,
+      profile: { name: u.name, ftp: u.ftp, weight: u.weight }
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to fetch settings' });
+  }
+});
+
+// Save user settings (for cross-device sync)
+app.put('/auth/settings', requireAuth, async (req, res) => {
+  const { settings } = req.body;
+  if (!settings || typeof settings !== 'object') return res.status(400).json({ error: 'Invalid settings' });
+  try {
+    await pool.query(
+      `UPDATE users SET settings = $1 WHERE id = $2`,
+      [JSON.stringify(settings), req.user.userId]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to save settings' });
   }
 });
 
