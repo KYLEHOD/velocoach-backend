@@ -597,6 +597,78 @@ app.get('/tp/athlete', async (req, res) => {
 });
 
 // ---------- Start ----------
+// ==========================================================
+//  INTERVALS.ICU PROXY  (avoids browser CORS/DELETE issues)
+// ==========================================================
+
+// DELETE all VeloCoach-pushed WORKOUT events in a date range, then POST new ones
+app.post('/api/icu/push-plan', requireAuth, async (req, res) => {
+  const { icuId, icuApiKey, sessions, startDate, endDate } = req.body;
+  if (!icuId || !icuApiKey || !sessions) {
+    return res.status(400).json({ error: 'icuId, icuApiKey and sessions required' });
+  }
+
+  const auth = 'Basic ' + Buffer.from('API_KEY:' + icuApiKey).toString('base64');
+  const headers = { 'Authorization': auth, 'Content-Type': 'application/json' };
+
+  // Step 1: list existing events in range
+  let deleted = 0;
+  try {
+    const listRes = await fetch(
+      `https://intervals.icu/api/v1/athlete/${icuId}/events?oldest=${startDate}&newest=${endDate}`,
+      { headers }
+    );
+    if (listRes.ok) {
+      const existing = await listRes.json();
+      for (const ev of existing) {
+        const cat = (ev.category || '').toUpperCase();
+        const isOurs = cat === 'WORKOUT' || (ev.description || '').includes('VeloCoach AI');
+        if (!isOurs) continue;
+        const d = await fetch(
+          `https://intervals.icu/api/v1/athlete/${icuId}/events/${ev.id}`,
+          { method: 'DELETE', headers }
+        );
+        if (d.ok) deleted++;
+        else console.warn('ICU delete failed', ev.id, d.status);
+      }
+    } else {
+      console.warn('ICU event list failed', listRes.status, await listRes.text());
+    }
+  } catch (e) {
+    console.warn('ICU list/delete error', e.message);
+  }
+
+  // Step 2: create new events
+  let pushed = 0, failed = 0, errors = [];
+  for (const s of sessions) {
+    const payload = {
+      category: 'WORKOUT',
+      start_date_local: s.date + 'T06:00:00',
+      name: s.name,
+      description: s.description,
+      type: 'Ride',
+      moving_time: s.moving_time,
+      workout_doc: s.workout_doc
+    };
+    try {
+      let r = await fetch(`https://intervals.icu/api/v1/athlete/${icuId}/events`, {
+        method: 'POST', headers, body: JSON.stringify(payload)
+      });
+      // Retry without workout_doc if rejected
+      if (!r.ok && r.status === 400) {
+        const { workout_doc, ...noZWO } = payload;
+        r = await fetch(`https://intervals.icu/api/v1/athlete/${icuId}/events`, {
+          method: 'POST', headers, body: JSON.stringify(noZWO)
+        });
+      }
+      if (r.ok) pushed++;
+      else { failed++; errors.push(await r.text().catch(() => r.status)); }
+    } catch (e) { failed++; errors.push(e.message); }
+  }
+
+  res.json({ deleted, pushed, failed, errors });
+});
+
 initSchema()
   .then(() => {
     app.listen(PORT, () => {
