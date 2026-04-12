@@ -625,3 +625,4 @@ initSchema()
     console.error('Failed to initialise DB schema:', err);
     process.exit(1);
   });
+
