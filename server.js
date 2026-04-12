@@ -39,11 +39,12 @@ async function initSchema() {
     );
   `);
 
-  // T&Cs tracking columns (safe to run on existing tables)
-  await pool.query(`
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS tcs_accepted_at TIMESTAMPTZ;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS tcs_version     TEXT;
-  `);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tcs_accepted_at    TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tcs_version        TEXT`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_athlete_id    BIGINT`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_access_token  TEXT`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_refresh_token TEXT`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_expires_at    INTEGER`);
 
   // Coaching queries log — rate limiting + analytics
   await pool.query(`
@@ -53,9 +54,13 @@ async function initSchema() {
       query      TEXT,
       response   TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW()
-    );
+    )
+  `);
+  // Index on (user_id, created_at) for daily rate-limit queries — created_at::date is STABLE
+  // not IMMUTABLE so can't be used in functional index; plain created_at works fine
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS coaching_queries_user_date
-      ON coaching_queries (user_id, (created_at::date));
+      ON coaching_queries (user_id, created_at)
   `);
 
   console.log('DB schema ready');
@@ -325,22 +330,39 @@ app.post('/api/plan/generate', requireAuth, async (req, res) => {
 // ==========================================================
 
 app.get('/strava/auth', (req, res) => {
-  const clientId = process.env.STRAVA_CLIENT_ID;
-  const redirectUri = `${process.env.BACKEND_URL}/strava/callback`;
+  const clientId  = process.env.STRAVA_CLIENT_ID;
+  const backendUrl = process.env.BACKEND_URL;
+  if (!clientId || !backendUrl) {
+    return res.status(500).json({ error: 'Strava integration not configured on server' });
+  }
+  const userToken = req.query.token;
+  if (!userToken) return res.status(401).json({ error: 'Authentication required' });
+  try { jwt.verify(userToken, JWT_SECRET); } catch (e) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+  const redirectUri = `${backendUrl}/strava/callback`;
   const scope = 'read,activity:read_all,profile:read_all';
   const stravaAuthUrl = `https://www.strava.com/oauth/authorize`
     + `?client_id=${clientId}`
     + `&redirect_uri=${encodeURIComponent(redirectUri)}`
     + `&response_type=code`
     + `&scope=${scope}`
-    + `&approval_prompt=auto`;
+    + `&approval_prompt=auto`
+    + `&state=${encodeURIComponent(userToken)}`;
   res.redirect(stravaAuthUrl);
 });
 
 app.get('/strava/callback', async (req, res) => {
-  const { code } = req.query;
+  const { code, state } = req.query;
   if (!code) return res.status(400).send('Missing authorization code from Strava');
-
+  if (!state) return res.status(400).send('Missing state — please try connecting Strava again from the app.');
+  let userId;
+  try {
+    const decoded = jwt.verify(state, JWT_SECRET);
+    userId = decoded.userId;
+  } catch (e) {
+    return res.status(400).send('Session expired — please try connecting Strava again from the app.');
+  }
   try {
     const response = await fetch('https://www.strava.com/oauth/token', {
       method: 'POST',
@@ -355,15 +377,14 @@ app.get('/strava/callback', async (req, res) => {
     if (!response.ok) return res.status(400).send('Failed to connect to Strava.');
 
     const athleteId = data.athlete.id;
-    tokenStore[athleteId] = {
-      access_token: data.access_token,
-      refresh_token: data.refresh_token,
-      expires_at: data.expires_at,
-      athlete: data.athlete
-    };
-    console.log(`Strava connected for ${data.athlete.firstname} ${data.athlete.lastname} (${athleteId})`);
+    await pool.query(
+      `UPDATE users SET strava_athlete_id=$1, strava_access_token=$2, strava_refresh_token=$3, strava_expires_at=$4 WHERE id=$5`,
+      [athleteId, data.access_token, data.refresh_token, data.expires_at, userId]
+    );
+    tokenStore[athleteId] = { access_token: data.access_token, refresh_token: data.refresh_token, expires_at: data.expires_at, athlete: data.athlete };
+    console.log(`Strava connected for ${data.athlete.firstname} ${data.athlete.lastname} (${athleteId}), user ${userId}`);
     const frontendUrl = process.env.FRONTEND_URL || 'https://velocoach-ai.netlify.app';
-    res.redirect(`${frontendUrl}?strava_athlete_id=${athleteId}&strava_connected=true`);
+    res.redirect(`${frontendUrl}?strava_connected=true`);
   } catch (error) {
     console.error('OAuth callback error:', error);
     res.status(500).send('Something went wrong connecting to Strava.');
