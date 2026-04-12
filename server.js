@@ -39,19 +39,15 @@ async function initSchema() {
     );
   `);
 
-  // T&Cs tracking columns (safe to run on existing tables)
-  await pool.query(`
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS tcs_accepted_at TIMESTAMPTZ;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS tcs_version     TEXT;
-  `);
+  // T&Cs tracking columns
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tcs_accepted_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS tcs_version     TEXT`);
 
   // Strava connection columns
-  await pool.query(`
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_athlete_id     BIGINT;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_access_token   TEXT;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_refresh_token  TEXT;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_expires_at     INTEGER;
-  `);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_athlete_id    BIGINT`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_access_token  TEXT`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_refresh_token TEXT`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_expires_at    INTEGER`);
 
   // Coaching queries log — rate limiting + analytics
   await pool.query(`
@@ -61,9 +57,11 @@ async function initSchema() {
       query      TEXT,
       response   TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW()
-    );
+    )
+  `);
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS coaching_queries_user_date
-      ON coaching_queries (user_id, (created_at::date));
+      ON coaching_queries (user_id, (created_at::date))
   `);
 
   console.log('DB schema ready');
