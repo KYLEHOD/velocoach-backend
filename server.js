@@ -384,7 +384,7 @@ app.get('/strava/callback', async (req, res) => {
     tokenStore[athleteId] = { access_token: data.access_token, refresh_token: data.refresh_token, expires_at: data.expires_at, athlete: data.athlete };
     console.log(`Strava connected for ${data.athlete.firstname} ${data.athlete.lastname} (${athleteId}), user ${userId}`);
     const frontendUrl = process.env.FRONTEND_URL || 'https://app.velocoach-ai.com';
-    res.redirect(`${frontendUrl}?strava_connected=true`);
+    res.redirect(`${frontendUrl}?strava_connected=true&strava_athlete_id=${athleteId}`);
   } catch (error) {
     console.error('OAuth callback error:', error);
     res.status(500).send('Something went wrong connecting to Strava.');
