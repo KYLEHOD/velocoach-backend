@@ -3,31 +3,61 @@
 // Handles Auth, Strava OAuth, and proxies activity data
 // ============================================================
 
-require('dotenv').config();
-const express = require('express');
-const cors    = require('cors');
-const crypto  = require('crypto');
-const bcrypt  = require('bcryptjs');
-const jwt     = require('jsonwebtoken');
-const { Pool } = require('pg');
-const app     = express();
-const PORT    = process.env.PORT || 3000;
+require('dotenv').config({ path: '.secrets/tokens.env' });
+const express   = require('express');
+const cors      = require('cors');
+const crypto    = require('crypto');
+const bcrypt    = require('bcryptjs');
+const jwt       = require('jsonwebtoken');
+const fs        = require('fs');
+const path      = require('path');
+const { Pool }  = require('pg');
+const Anthropic = require('@anthropic-ai/sdk');
+const app       = express();
+const PORT      = process.env.PORT || 3000;
+
+// ---------- Anthropic ----------
+const anthropic = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
+const COACHING_MODEL      = 'claude-sonnet-4-6';
+const RATE_LIMIT_PER_DAY  = parseInt(process.env.RATE_LIMIT_QUERIES_PER_DAY || '50', 10);
+const coachingPrompt      = fs.readFileSync(path.join(__dirname, 'coaching-prompt.txt'), 'utf-8');
 
 // ---------- PostgreSQL ----------
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 async function initSchema() {
+  // Core users table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
-      id           SERIAL PRIMARY KEY,
-      email        TEXT UNIQUE NOT NULL,
-      name         TEXT NOT NULL DEFAULT 'Athlete',
+      id            SERIAL PRIMARY KEY,
+      email         TEXT UNIQUE NOT NULL,
+      name          TEXT NOT NULL DEFAULT 'Athlete',
       password_hash TEXT NOT NULL,
-      ftp          INTEGER DEFAULT 300,
-      weight       NUMERIC(5,2) DEFAULT 75,
-      created_at   TIMESTAMPTZ DEFAULT NOW()
+      ftp           INTEGER DEFAULT 300,
+      weight        NUMERIC(5,2) DEFAULT 75,
+      created_at    TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+
+  // T&Cs tracking columns (safe to run on existing tables)
+  await pool.query(`
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS tcs_accepted_at TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS tcs_version     TEXT;
+  `);
+
+  // Coaching queries log — rate limiting + analytics
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS coaching_queries (
+      id         SERIAL PRIMARY KEY,
+      user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      query      TEXT,
+      response   TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS coaching_queries_user_date
+      ON coaching_queries (user_id, (created_at::date));
+  `);
+
   console.log('DB schema ready');
 }
 
@@ -91,16 +121,19 @@ app.get('/', (req, res) => {
 
 // Sign up
 app.post('/auth/signup', async (req, res) => {
-  const { email, password, name } = req.body;
+  const { email, password, name, tcs_accepted, tcs_version } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
   if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  if (!tcs_accepted) return res.status(400).json({ error: 'You must accept the Terms of Service to create an account' });
 
   const normalizedEmail = email.toLowerCase().trim();
   try {
     const password_hash = await bcrypt.hash(password, 12);
     const { rows } = await pool.query(
-      `INSERT INTO users (email, name, password_hash) VALUES ($1, $2, $3) RETURNING id, email, name`,
-      [normalizedEmail, name || 'Athlete', password_hash]
+      `INSERT INTO users (email, name, password_hash, tcs_accepted_at, tcs_version)
+       VALUES ($1, $2, $3, NOW(), $4)
+       RETURNING id, email, name`,
+      [normalizedEmail, name || 'Athlete', password_hash, tcs_version || '1.0']
     );
     const user = rows[0];
     const token = signToken(user.id, user.email);
@@ -172,6 +205,118 @@ app.put('/auth/profile', requireAuth, async (req, res) => {
     res.json({ userId: u.id, email: u.email, name: u.name, profile: { ftp: u.ftp, weight: u.weight } });
   } catch (e) {
     res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+// ==========================================================
+//  COACHING ENDPOINT
+// ==========================================================
+
+app.post('/api/coaching/ask', requireAuth, async (req, res) => {
+  const userId = req.user.userId;
+  const { userMsg, systemSupplement } = req.body;
+
+  if (!userMsg) return res.status(400).json({ error: 'userMsg is required' });
+
+  // Rate limit: count today's queries for this user
+  try {
+    const { rows } = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM coaching_queries
+        WHERE user_id = $1 AND created_at::date = CURRENT_DATE`,
+      [userId]
+    );
+    if (parseInt(rows[0].cnt, 10) >= RATE_LIMIT_PER_DAY) {
+      return res.status(429).json({
+        error: `Daily coaching limit reached (${RATE_LIMIT_PER_DAY} queries/day). Try again tomorrow.`
+      });
+    }
+  } catch (e) {
+    console.error('Rate limit check failed:', e);
+    // Allow through on DB error — don't block users due to rate-limit DB issues
+  }
+
+  // Build system prompt: base prompt from file + optional athlete-specific supplement
+  const systemPrompt = systemSupplement
+    ? `${coachingPrompt}\n\n---\nATHLETE PROFILE (personalised context):\n${systemSupplement}`
+    : coachingPrompt;
+
+  try {
+    const message = await anthropic.messages.create({
+      model:      COACHING_MODEL,
+      max_tokens: 2000,
+      system:     systemPrompt,
+      messages:   [{ role: 'user', content: userMsg }]
+    });
+
+    const responseText = message.content[0].text;
+
+    // Log query for analytics and rate limiting
+    await pool.query(
+      `INSERT INTO coaching_queries (user_id, query, response) VALUES ($1, $2, $3)`,
+      [userId, userMsg.slice(0, 2000), responseText.slice(0, 8000)]
+    ).catch(err => console.error('Failed to log coaching query:', err));
+
+    console.log(`Coaching query for user ${userId} — ${message.usage?.input_tokens || '?'} in / ${message.usage?.output_tokens || '?'} out tokens`);
+    res.json({ coaching_response: responseText, timestamp: new Date() });
+
+  } catch (e) {
+    console.error('Claude API error:', e);
+    res.status(503).json({ error: 'Coaching temporarily unavailable. Please try again in a few moments.' });
+  }
+});
+
+// ==========================================================
+//  PLAN GENERATION ENDPOINT
+// ==========================================================
+
+app.post('/api/plan/generate', requireAuth, async (req, res) => {
+  const userId = req.user.userId;
+  const { messages, system } = req.body;
+
+  if (!messages || !Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ error: 'messages array is required' });
+  }
+
+  // Rate limit: shared with coaching queries
+  try {
+    const { rows } = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM coaching_queries
+        WHERE user_id = $1 AND created_at::date = CURRENT_DATE`,
+      [userId]
+    );
+    if (parseInt(rows[0].cnt, 10) >= RATE_LIMIT_PER_DAY) {
+      return res.status(429).json({
+        error: `Daily query limit reached (${RATE_LIMIT_PER_DAY}/day). Try again tomorrow.`
+      });
+    }
+  } catch (e) {
+    console.error('Rate limit check failed:', e);
+  }
+
+  try {
+    const createParams = {
+      model:      COACHING_MODEL,
+      max_tokens: 4000,
+      messages
+    };
+    if (system) createParams.system = system;
+
+    const message = await anthropic.messages.create(createParams);
+    const responseText = message.content[0].text;
+
+    // Log for rate limiting and analytics
+    const queryPreview = messages[messages.length - 1]?.content?.slice?.(0, 2000) || '';
+    await pool.query(
+      `INSERT INTO coaching_queries (user_id, query, response) VALUES ($1, $2, $3)`,
+      [userId, queryPreview, responseText.slice(0, 8000)]
+    ).catch(err => console.error('Failed to log plan query:', err));
+
+    console.log(`Plan generation for user ${userId} — ${message.usage?.input_tokens || '?'} in / ${message.usage?.output_tokens || '?'} out tokens`);
+    res.json({ response: responseText });
+
+  } catch (e) {
+    console.error('Claude API error (plan generate):', e);
+    res.status(503).json({ error: 'Plan generation temporarily unavailable. Please try again in a few moments.' });
   }
 });
 
