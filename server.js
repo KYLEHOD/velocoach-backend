@@ -7,8 +7,29 @@ require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');
 const crypto  = require('crypto');
+const bcrypt  = require('bcryptjs');
+const jwt     = require('jsonwebtoken');
+const { Pool } = require('pg');
 const app     = express();
 const PORT    = process.env.PORT || 3000;
+
+// ---------- PostgreSQL ----------
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
+async function initSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id           SERIAL PRIMARY KEY,
+      email        TEXT UNIQUE NOT NULL,
+      name         TEXT NOT NULL DEFAULT 'Athlete',
+      password_hash TEXT NOT NULL,
+      ftp          INTEGER DEFAULT 300,
+      weight       NUMERIC(5,2) DEFAULT 75,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  console.log('DB schema ready');
+}
 
 // ---------- CORS ----------
 const ALLOWED_ORIGINS = [
@@ -29,33 +50,16 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// ---------- In-memory stores ----------
-const tokenStore   = {};   // Strava tokens
-const tpTokenStore = {};   // TrainingPeaks tokens
-const userStore    = {};   // Auth users: { email: { id, email, name, passwordHash, salt, profile, createdAt } }
-const sessionStore = {};   // Auth sessions: { token: { userId, email, expiresAt } }
+// ---------- In-memory stores (Strava + TP only) ----------
+const tokenStore   = {};   // Strava tokens  { athleteId: { access_token, refresh_token, expires_at, athlete } }
+const tpTokenStore = {};   // TrainingPeaks  { athlete_id: { token, connected_at } }
 
 // ---------- Auth helpers ----------
-const JWT_SECRET = process.env.JWT_SECRET || 'velocoach-secret-' + crypto.randomBytes(16).toString('hex');
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) { console.error('FATAL: JWT_SECRET env var not set'); process.exit(1); }
 
-function hashPassword(password, salt) {
-  if (!salt) salt = crypto.randomBytes(32).toString('hex');
-  const hash = crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
-  return { hash, salt };
-}
-
-function generateToken(userId, email) {
-  const token = crypto.randomBytes(48).toString('hex');
-  const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30 days
-  sessionStore[token] = { userId, email, expiresAt };
-  return token;
-}
-
-function verifyToken(token) {
-  const session = sessionStore[token];
-  if (!session) return null;
-  if (Date.now() > session.expiresAt) { delete sessionStore[token]; return null; }
-  return session;
+function signToken(userId, email) {
+  return jwt.sign({ userId, email }, JWT_SECRET, { expiresIn: '30d' });
 }
 
 // Auth middleware
@@ -64,12 +68,12 @@ function requireAuth(req, res, next) {
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Authentication required' });
   }
-  const token = authHeader.slice(7);
-  const session = verifyToken(token);
-  if (!session) return res.status(401).json({ error: 'Invalid or expired token' });
-  req.userId = session.userId;
-  req.userEmail = session.email;
-  next();
+  try {
+    req.user = jwt.verify(authHeader.slice(7), JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired token' });
+  }
 }
 
 // ---------- Health check ----------
@@ -86,85 +90,89 @@ app.get('/', (req, res) => {
 // ==========================================================
 
 // Sign up
-app.post('/auth/signup', (req, res) => {
+app.post('/auth/signup', async (req, res) => {
   const { email, password, name } = req.body;
-
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required' });
-  }
-  if (password.length < 6) {
-    return res.status(400).json({ error: 'Password must be at least 6 characters' });
-  }
+  if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
+  if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
 
   const normalizedEmail = email.toLowerCase().trim();
-  if (userStore[normalizedEmail]) {
-    return res.status(409).json({ error: 'An account with this email already exists. Try signing in.' });
+  try {
+    const password_hash = await bcrypt.hash(password, 12);
+    const { rows } = await pool.query(
+      `INSERT INTO users (email, name, password_hash) VALUES ($1, $2, $3) RETURNING id, email, name`,
+      [normalizedEmail, name || 'Athlete', password_hash]
+    );
+    const user = rows[0];
+    const token = signToken(user.id, user.email);
+    console.log(`New user signed up: ${user.email} (${user.id})`);
+    res.json({ token, userId: user.id, email: user.email, name: user.name });
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'An account with this email already exists. Try signing in.' });
+    console.error('Signup error:', e);
+    res.status(500).json({ error: 'Failed to create account' });
   }
-
-  const userId = 'u_' + crypto.randomBytes(12).toString('hex');
-  const { hash, salt } = hashPassword(password);
-
-  userStore[normalizedEmail] = {
-    id: userId,
-    email: normalizedEmail,
-    name: name || 'Athlete',
-    passwordHash: hash,
-    salt,
-    profile: { name: name || 'Athlete' },
-    createdAt: Date.now()
-  };
-
-  const token = generateToken(userId, normalizedEmail);
-  console.log(`New user signed up: ${normalizedEmail} (${userId})`);
-
-  res.json({ token, userId, email: normalizedEmail, name: name || 'Athlete' });
 });
 
 // Login
-app.post('/auth/login', (req, res) => {
+app.post('/auth/login', async (req, res) => {
   const { email, password } = req.body;
-
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required' });
-  }
+  if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
 
   const normalizedEmail = email.toLowerCase().trim();
-  const user = userStore[normalizedEmail];
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, email, name, password_hash, ftp, weight FROM users WHERE email = $1`,
+      [normalizedEmail]
+    );
+    const user = rows[0];
+    if (!user) return res.status(401).json({ error: 'Invalid email or password' });
 
-  if (!user) {
-    return res.status(401).json({ error: 'No account found with this email. Try creating one.' });
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
+
+    const token = signToken(user.id, user.email);
+    console.log(`User logged in: ${user.email}`);
+    res.json({ token, userId: user.id, email: user.email, name: user.name, profile: { ftp: user.ftp, weight: user.weight } });
+  } catch (e) {
+    console.error('Login error:', e);
+    res.status(500).json({ error: 'Login failed' });
   }
-
-  const { hash } = hashPassword(password, user.salt);
-  if (hash !== user.passwordHash) {
-    return res.status(401).json({ error: 'Incorrect password. Please try again.' });
-  }
-
-  const token = generateToken(user.id, normalizedEmail);
-  console.log(`User logged in: ${normalizedEmail}`);
-
-  res.json({
-    token,
-    userId: user.id,
-    email: normalizedEmail,
-    name: user.name,
-    profile: user.profile
-  });
 });
 
-// Get/update profile (authenticated)
-app.get('/auth/profile', requireAuth, (req, res) => {
-  const user = Object.values(userStore).find(u => u.id === req.userId);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  res.json({ userId: user.id, email: user.email, name: user.name, profile: user.profile });
+// Get profile (authenticated)
+app.get('/auth/profile', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, email, name, ftp, weight FROM users WHERE id = $1`,
+      [req.user.userId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+    const u = rows[0];
+    res.json({ userId: u.id, email: u.email, name: u.name, profile: { ftp: u.ftp, weight: u.weight } });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to fetch profile' });
+  }
 });
 
-app.put('/auth/profile', requireAuth, (req, res) => {
-  const user = Object.values(userStore).find(u => u.id === req.userId);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  if (req.body.name) user.name = req.body.name;
-  if (req.body.profile) Object.assign(user.profile, req.body.profile);
-  res.json({ userId: user.id, email: user.email, name: user.name, profile: user.profile });
+// Update profile (authenticated)
+app.put('/auth/profile', requireAuth, async (req, res) => {
+  const { name, ftp, weight } = req.body;
+  try {
+    const { rows } = await pool.query(
+      `UPDATE users SET
+        name   = COALESCE($1, name),
+        ftp    = COALESCE($2, ftp),
+        weight = COALESCE($3, weight)
+       WHERE id = $4
+       RETURNING id, email, name, ftp, weight`,
+      [name || null, ftp || null, weight || null, req.user.userId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+    const u = rows[0];
+    res.json({ userId: u.id, email: u.email, name: u.name, profile: { ftp: u.ftp, weight: u.weight } });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
 });
 
 // ==========================================================
@@ -383,10 +391,16 @@ app.get('/tp/athlete', async (req, res) => {
 });
 
 // ---------- Start ----------
-app.listen(PORT, () => {
-  console.log(`VeloCoach Backend running on port ${PORT}`);
-  console.log(`Frontend: ${process.env.FRONTEND_URL}`);
-  console.log(`Auth: /auth/signup, /auth/login`);
-  console.log(`Strava: ${process.env.BACKEND_URL}/strava/auth`);
-  console.log(`TrainingPeaks: enabled`);
-});
+initSchema()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`VeloCoach Backend running on port ${PORT}`);
+      console.log(`Auth: /auth/signup, /auth/login (PostgreSQL)`);
+      console.log(`Strava: ${process.env.BACKEND_URL}/strava/auth`);
+      console.log(`TrainingPeaks: enabled`);
+    });
+  })
+  .catch(err => {
+    console.error('Failed to initialise DB schema:', err);
+    process.exit(1);
+  });
