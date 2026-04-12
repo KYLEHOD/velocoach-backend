@@ -84,7 +84,7 @@ app.use(cors({
     },
     credentials: true
 }));
-app.use(express.json());
+app.use(express.json({ limit: '4mb' }));
 
 // ---------- In-memory stores (Strava + TP only) ----------
 const tokenStore   = {};   // Strava tokens  { athleteId: { access_token, refresh_token, expires_at, athlete } }
@@ -341,10 +341,10 @@ app.post('/api/plan/generate', requireAuth, async (req, res) => {
   try {
     const createParams = {
       model:      COACHING_MODEL,
-      max_tokens: 4000,
+      max_tokens: 2000,
+      system:     system || 'Return ONLY compact valid JSON. No markdown, no code blocks, no explanation. Minimise whitespace.',
       messages
     };
-    if (system) createParams.system = system;
 
     const message = await anthropic.messages.create(createParams);
     const responseText = message.content[0].text;
