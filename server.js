@@ -288,7 +288,7 @@ app.post('/api/coaching/ask', requireAuth, async (req, res) => {
   try {
     const message = await anthropic.messages.create({
       model:      COACHING_MODEL,
-      max_tokens: 2000,
+      max_tokens: 8000,
       system:     systemPrompt,
       messages:   [{ role: 'user', content: userMsg }]
     });
@@ -341,7 +341,7 @@ app.post('/api/plan/generate', requireAuth, async (req, res) => {
   try {
     const createParams = {
       model:      COACHING_MODEL,
-      max_tokens: 2000,
+      max_tokens: 8000,
       system:     system || 'Return ONLY compact valid JSON. No markdown, no code blocks, no explanation. Minimise whitespace.',
       messages
     };
