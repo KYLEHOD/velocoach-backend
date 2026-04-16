@@ -46,6 +46,8 @@ async function initSchema() {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_refresh_token TEXT`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS strava_expires_at    INTEGER`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS settings             JSONB DEFAULT '{}'`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS intervals_athlete_id TEXT`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS intervals_api_key    TEXT`);
 
   // Coaching queries log — rate limiting + analytics
   await pool.query(`
@@ -223,7 +225,7 @@ app.put('/auth/profile', requireAuth, async (req, res) => {
 app.get('/auth/settings', requireAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT settings, strava_athlete_id, name, ftp, weight FROM users WHERE id = $1`,
+      `SELECT settings, strava_athlete_id, name, ftp, weight, intervals_athlete_id, intervals_api_key FROM users WHERE id = $1`,
       [req.user.userId]
     );
     if (!rows[0]) return res.status(404).json({ error: 'User not found' });
@@ -231,6 +233,8 @@ app.get('/auth/settings', requireAuth, async (req, res) => {
     res.json({
       settings: u.settings || {},
       strava_athlete_id: u.strava_athlete_id || null,
+      intervals_athlete_id: u.intervals_athlete_id || null,
+      intervals_api_key: u.intervals_api_key || null,
       profile: { name: u.name, ftp: u.ftp, weight: u.weight }
     });
   } catch (e) {
@@ -250,6 +254,20 @@ app.put('/auth/settings', requireAuth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: 'Failed to save settings' });
+  }
+});
+
+// Save intervals.icu credentials against the user account
+app.put('/auth/integrations', requireAuth, async (req, res) => {
+  const { intervals_athlete_id, intervals_api_key } = req.body;
+  try {
+    await pool.query(
+      `UPDATE users SET intervals_athlete_id=$1, intervals_api_key=$2 WHERE id=$3`,
+      [intervals_athlete_id || null, intervals_api_key || null, req.user.userId]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to save integrations' });
   }
 });
 
