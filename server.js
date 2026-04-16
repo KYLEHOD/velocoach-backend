@@ -271,6 +271,39 @@ app.put('/auth/integrations', requireAuth, async (req, res) => {
   }
 });
 
+// Proxy intervals.icu activities (uses server-stored credentials)
+app.get('/icu/activities', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT intervals_athlete_id, intervals_api_key FROM users WHERE id = $1`,
+      [req.user.userId]
+    );
+    const u = rows[0];
+    if (!u || !u.intervals_athlete_id || !u.intervals_api_key) {
+      return res.status(400).json({ error: 'intervals.icu not connected' });
+    }
+    const oldest = req.query.oldest || (() => {
+      const d = new Date(); d.setDate(d.getDate() - 14);
+      return d.toISOString().split('T')[0];
+    })();
+    const creds = Buffer.from(`API_KEY:${u.intervals_api_key}`).toString('base64');
+    const r = await fetch(
+      `https://intervals.icu/api/v1/athlete/${u.intervals_athlete_id}/activities?oldest=${oldest}`,
+      { headers: { Authorization: `Basic ${creds}` } }
+    );
+    const body = await r.text();
+    if (!r.ok) {
+      console.error(`[ICU activities] ${r.status}: ${body}`);
+      return res.status(r.status).json({ error: `intervals.icu returned ${r.status}`, detail: body });
+    }
+    res.setHeader('Content-Type', 'application/json');
+    res.send(body);
+  } catch (e) {
+    console.error('[ICU activities] error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ==========================================================
 //  COACHING ENDPOINT
 // ==========================================================
