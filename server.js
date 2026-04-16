@@ -292,8 +292,8 @@ app.get('/icu/activities', requireAuth, async (req, res) => {
       { headers: { Authorization: `Basic ${creds}` } }
     );
     const body = await r.text();
+    console.log(`[ICU activities] status=${r.status} length=${body.length} preview=${body.substring(0, 400)}`);
     if (!r.ok) {
-      console.error(`[ICU activities] ${r.status}: ${body}`);
       return res.status(r.status).json({ error: `intervals.icu returned ${r.status}`, detail: body });
     }
     res.setHeader('Content-Type', 'application/json');
