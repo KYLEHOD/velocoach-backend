@@ -88,9 +88,8 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '4mb' }));
 
-// ---------- In-memory stores (Strava + TP only) ----------
+// ---------- In-memory stores (Strava only) ----------
 const tokenStore   = {};   // Strava tokens  { athleteId: { access_token, refresh_token, expires_at, athlete } }
-const tpTokenStore = {};   // TrainingPeaks  { athlete_id: { token, connected_at } }
 
 // ---------- Auth helpers ----------
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -119,7 +118,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'VeloCoach Backend',
-    endpoints: ['/auth/signup', '/auth/login', '/auth/profile', '/strava/auth', '/strava/callback', '/tp/connect', '/tp/workouts']
+    endpoints: ['/auth/signup', '/auth/login', '/auth/profile', '/strava/auth', '/strava/callback', '/icu/activities']
   });
 });
 
@@ -534,118 +533,6 @@ app.get('/strava/status', (req, res) => {
   res.json({ connected, athlete_id: connected ? athlete_id : null });
 });
 
-// ==========================================================
-//  TRAININGPEAKS API PROXY
-// ==========================================================
-
-app.post('/tp/connect', (req, res) => {
-  const { athlete_id, token } = req.body;
-  if (!athlete_id || !token) return res.status(400).json({ error: 'athlete_id and token required' });
-  tpTokenStore[athlete_id] = { token, connected_at: Date.now() };
-  console.log(`TrainingPeaks connected for athlete ${athlete_id}`);
-  res.json({ connected: true, athlete_id });
-});
-
-app.get('/tp/status', (req, res) => {
-  const { athlete_id } = req.query;
-  const connected = !!(athlete_id && tpTokenStore[athlete_id]);
-  res.json({ connected, athlete_id: connected ? athlete_id : null });
-});
-
-app.post('/tp/disconnect', (req, res) => {
-  const { athlete_id } = req.body;
-  if (athlete_id && tpTokenStore[athlete_id]) delete tpTokenStore[athlete_id];
-  res.json({ connected: false });
-});
-
-function getTPToken(athlete_id, res) {
-  if (!athlete_id || !tpTokenStore[athlete_id]) {
-    res.status(401).json({ error: 'Not connected' });
-    return null;
-  }
-  return tpTokenStore[athlete_id].token;
-}
-
-app.get('/tp/workouts', async (req, res) => {
-  const { athlete_id, start_date, end_date } = req.query;
-  const token = getTPToken(athlete_id, res);
-  if (!token) return;
-  try {
-    const url = `https://tpapi.trainingpeaks.com/fitness/v6/athletes/${athlete_id}/workouts/${start_date}/${end_date}`;
-    const response = await fetch(url, { headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' } });
-    if (!response.ok) return res.status(response.status).json({ error: 'Failed to fetch workouts' });
-    res.json(await response.json());
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch workouts from TrainingPeaks' });
-  }
-});
-
-app.post('/tp/workouts', async (req, res) => {
-  const { athlete_id } = req.query;
-  const token = getTPToken(athlete_id, res);
-  if (!token) return;
-  try {
-    const url = `https://tpapi.trainingpeaks.com/fitness/v1/athletes/${athlete_id}/workouts`;
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify(req.body)
-    });
-    if (!response.ok) return res.status(response.status).json({ error: 'Failed to create workout' });
-    res.json(await response.json());
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to create workout on TrainingPeaks' });
-  }
-});
-
-app.put('/tp/workouts/:workoutId', async (req, res) => {
-  const { athlete_id } = req.query;
-  const { workoutId } = req.params;
-  const token = getTPToken(athlete_id, res);
-  if (!token) return;
-  try {
-    const url = `https://tpapi.trainingpeaks.com/fitness/v3/athletes/${athlete_id}/workouts/${workoutId}`;
-    const response = await fetch(url, {
-      method: 'PUT',
-      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify(req.body)
-    });
-    if (!response.ok) return res.status(response.status).json({ error: 'Failed to update workout' });
-    res.json(await response.json());
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update workout on TrainingPeaks' });
-  }
-});
-
-app.delete('/tp/workouts/:workoutId', async (req, res) => {
-  const { athlete_id } = req.query;
-  const { workoutId } = req.params;
-  const token = getTPToken(athlete_id, res);
-  if (!token) return;
-  try {
-    const url = `https://tpapi.trainingpeaks.com/fitness/v3/athletes/${athlete_id}/workouts/${workoutId}`;
-    const response = await fetch(url, { method: 'DELETE', headers: { 'Authorization': `Bearer ${token}` } });
-    if (!response.ok) return res.status(response.status).json({ error: 'Failed to delete workout' });
-    res.json({ deleted: true, workoutId });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to delete workout on TrainingPeaks' });
-  }
-});
-
-app.get('/tp/athlete', async (req, res) => {
-  const { athlete_id } = req.query;
-  const token = getTPToken(athlete_id, res);
-  if (!token) return;
-  try {
-    const response = await fetch('https://tpapi.trainingpeaks.com/users/v3/user', {
-      headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
-    });
-    if (!response.ok) return res.status(response.status).json({ error: 'Failed to fetch TP profile' });
-    res.json(await response.json());
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch TrainingPeaks profile' });
-  }
-});
 
 // ---------- Start ----------
 // ==========================================================
@@ -729,7 +616,6 @@ initSchema()
       console.log(`VeloCoach Backend running on port ${PORT}`);
       console.log(`Auth: /auth/signup, /auth/login (PostgreSQL)`);
       console.log(`Strava: ${process.env.BACKEND_URL}/strava/auth`);
-      console.log(`TrainingPeaks: enabled`);
     });
   })
   .catch(err => {
