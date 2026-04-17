@@ -210,7 +210,7 @@ app.put('/auth/profile', requireAuth, async (req, res) => {
         weight = COALESCE($3, weight)
        WHERE id = $4
        RETURNING id, email, name, ftp, weight`,
-      [name || null, ftp || null, weight || null, req.user.userId]
+      [name ?? null, ftp != null ? ftp : null, weight != null ? weight : null, req.user.userId]
     );
     if (!rows[0]) return res.status(404).json({ error: 'User not found' });
     const u = rows[0];
@@ -487,50 +487,84 @@ async function refreshStravaToken(athleteId) {
   const now = Math.floor(Date.now() / 1000);
   if (stored.expires_at > now + 300) return stored.access_token;
 
-  const response = await fetch('https://www.strava.com/oauth/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      client_id: process.env.STRAVA_CLIENT_ID,
-      client_secret: process.env.STRAVA_CLIENT_SECRET,
-      grant_type: 'refresh_token',
-      refresh_token: stored.refresh_token
-    })
-  });
-  const data = await response.json();
-  if (!response.ok) return null;
-  stored.access_token = data.access_token;
-  stored.refresh_token = data.refresh_token;
-  stored.expires_at = data.expires_at;
-  return data.access_token;
+  try {
+    const response = await fetch('https://www.strava.com/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: process.env.STRAVA_CLIENT_ID,
+        client_secret: process.env.STRAVA_CLIENT_SECRET,
+        grant_type: 'refresh_token',
+        refresh_token: stored.refresh_token
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) return null;
+    stored.access_token = data.access_token;
+    stored.refresh_token = data.refresh_token;
+    stored.expires_at = data.expires_at;
+    // Persist refreshed tokens to DB so they survive restarts
+    await pool.query(
+      `UPDATE users SET strava_access_token=$1, strava_refresh_token=$2, strava_expires_at=$3 WHERE strava_athlete_id=$4`,
+      [data.access_token, data.refresh_token, data.expires_at, athleteId]
+    );
+    return data.access_token;
+  } catch (e) {
+    console.error('refreshStravaToken error:', e.message);
+    return null;
+  }
 }
 
-// Strava data endpoints
-app.get('/strava/activities', async (req, res) => {
-  const { athlete_id, per_page = 30, page = 1 } = req.query;
-  if (!athlete_id || !tokenStore[athlete_id]) return res.status(401).json({ error: 'Not connected' });
+// Strava data endpoints (JWT-authenticated — athlete_id is looked up from DB, not trusted from query)
+app.get('/strava/activities', requireAuth, async (req, res) => {
+  const { per_page = 30, page = 1 } = req.query;
   try {
-    const accessToken = await refreshStravaToken(athlete_id);
-    if (!accessToken) return res.status(401).json({ error: 'Token expired. Please reconnect.' });
-    const response = await fetch(`https://www.strava.com/api/v3/athlete/activities?per_page=${per_page}&page=${page}`, {
-      headers: { 'Authorization': `Bearer ${accessToken}` }
-    });
+    const { rows } = await pool.query(
+      `SELECT strava_athlete_id FROM users WHERE id = $1`,
+      [req.user.userId]
+    );
+    const athleteId = rows[0]?.strava_athlete_id;
+    if (!athleteId) return res.status(401).json({ error: 'Strava not connected' });
+    const accessToken = await refreshStravaToken(athleteId);
+    if (!accessToken) return res.status(401).json({ error: 'Token expired. Please reconnect Strava.' });
+    const response = await fetch(
+      `https://www.strava.com/api/v3/athlete/activities?per_page=${per_page}&page=${page}`,
+      { headers: { 'Authorization': `Bearer ${accessToken}` } }
+    );
     res.json(await response.json());
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch activities from Strava' });
   }
 });
 
-app.get('/strava/athlete', async (req, res) => {
-  const { athlete_id } = req.query;
-  if (!athlete_id || !tokenStore[athlete_id]) return res.status(401).json({ error: 'Not connected' });
-  res.json(tokenStore[athlete_id].athlete);
+app.get('/strava/athlete', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT strava_athlete_id FROM users WHERE id = $1`,
+      [req.user.userId]
+    );
+    const athleteId = rows[0]?.strava_athlete_id;
+    if (!athleteId || !tokenStore[athleteId]) {
+      return res.status(401).json({ error: 'Strava not connected' });
+    }
+    res.json(tokenStore[athleteId].athlete);
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to fetch Strava athlete' });
+  }
 });
 
-app.get('/strava/status', (req, res) => {
-  const { athlete_id } = req.query;
-  const connected = !!(athlete_id && tokenStore[athlete_id]);
-  res.json({ connected, athlete_id: connected ? athlete_id : null });
+app.get('/strava/status', requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT strava_athlete_id FROM users WHERE id = $1`,
+      [req.user.userId]
+    );
+    const athleteId = rows[0]?.strava_athlete_id;
+    const connected = !!(athleteId && tokenStore[athleteId]);
+    res.json({ connected, athlete_id: connected ? athleteId : null });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to check Strava status' });
+  }
 });
 
 
@@ -607,7 +641,28 @@ app.post('/api/icu/push-plan', requireAuth, async (req, res) => {
   res.json({ deleted, pushed, failed, errors });
 });
 
+async function initTokenStore() {
+  try {
+    const { rows } = await pool.query(
+      `SELECT strava_athlete_id, strava_access_token, strava_refresh_token, strava_expires_at
+       FROM users WHERE strava_athlete_id IS NOT NULL AND strava_access_token IS NOT NULL`
+    );
+    for (const row of rows) {
+      tokenStore[row.strava_athlete_id] = {
+        access_token:  row.strava_access_token,
+        refresh_token: row.strava_refresh_token,
+        expires_at:    row.strava_expires_at,
+        athlete:       { id: row.strava_athlete_id }
+      };
+    }
+    console.log(`Restored Strava tokens for ${rows.length} athlete(s) from DB`);
+  } catch (e) {
+    console.warn('Could not restore tokenStore from DB:', e.message);
+  }
+}
+
 initSchema()
+  .then(initTokenStore)
   .then(() => {
     const server = app.listen(PORT, () => {
       // Extend keepalive so Railway proxy doesn't cut long-running AI requests (plan gen ~90s)
