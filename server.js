@@ -722,7 +722,10 @@ app.post('/api/icu/push-plan', requireAuth, async (req, res) => {
 
 initSchema()
   .then(() => {
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
+      // Extend keepalive so Railway proxy doesn't cut long-running AI requests (plan gen ~90s)
+      server.keepAliveTimeout = 120000;
+      server.headersTimeout   = 125000;
       console.log(`VeloCoach Backend running on port ${PORT}`);
       console.log(`Auth: /auth/signup, /auth/login (PostgreSQL)`);
       console.log(`Strava: ${process.env.BACKEND_URL}/strava/auth`);
