@@ -193,7 +193,7 @@ app.get('/auth/profile', requireAuth, async (req, res) => {
     );
     if (!rows[0]) return res.status(404).json({ error: 'User not found' });
     const u = rows[0];
-    res.json({ userId: u.id, email: u.email, name: u.name, profile: { ftp: u.ftp, weight: u.weight } });
+    res.json({ userId: u.id, email: u.email, name: u.name, profile: { ftp: u.ftp, weight: u.weight != null ? parseFloat(u.weight) : null } });
   } catch (e) {
     res.status(500).json({ error: 'Failed to fetch profile' });
   }
@@ -214,7 +214,7 @@ app.put('/auth/profile', requireAuth, async (req, res) => {
     );
     if (!rows[0]) return res.status(404).json({ error: 'User not found' });
     const u = rows[0];
-    res.json({ userId: u.id, email: u.email, name: u.name, profile: { ftp: u.ftp, weight: u.weight } });
+    res.json({ userId: u.id, email: u.email, name: u.name, profile: { ftp: u.ftp, weight: u.weight != null ? parseFloat(u.weight) : null } });
   } catch (e) {
     res.status(500).json({ error: 'Failed to update profile' });
   }
@@ -234,7 +234,7 @@ app.get('/auth/settings', requireAuth, async (req, res) => {
       strava_athlete_id: u.strava_athlete_id || null,
       intervals_athlete_id: u.intervals_athlete_id || null,
       intervals_api_key: u.intervals_api_key || null,
-      profile: { name: u.name, ftp: u.ftp, weight: u.weight }
+      profile: { name: u.name, ftp: u.ftp, weight: u.weight != null ? parseFloat(u.weight) : null }
     });
   } catch (e) {
     res.status(500).json({ error: 'Failed to fetch settings' });
