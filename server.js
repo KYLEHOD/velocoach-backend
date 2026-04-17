@@ -391,8 +391,8 @@ app.post('/api/plan/generate', requireAuth, async (req, res) => {
   try {
     const createParams = {
       model:      COACHING_MODEL,
-      max_tokens: 8000,
-      system:     system || 'Return ONLY compact valid JSON. No markdown, no code blocks, no explanation. Minimise whitespace.',
+      max_tokens: 16000,
+      system:     system || 'Return ONLY compact valid JSON. No markdown, no code blocks, no explanation. Minimise whitespace. Keep all string values concise.',
       messages
     };
 
